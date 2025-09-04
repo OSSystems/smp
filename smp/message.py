@@ -6,7 +6,8 @@ import itertools
 import logging
 from abc import ABC
 from enum import IntEnum, unique
-from typing import ClassVar, Type, TypeVar, cast
+from typing import Any, ClassVar, Type, TypeVar, cast
+from dataclasses import replace
 
 import cbor2
 from pydantic import BaseModel, ConfigDict
@@ -43,6 +44,7 @@ class _MessageBase(ABC, BaseModel):
     version: smpheader.Version = smpheader.Version.V2
     sequence: int = None  # type: ignore
     smp_data: bytes = None  # type: ignore
+    forward_tree: smpheader.ForwardTree | None = None
 
     def __bytes__(self) -> bytes:
         return self.smp_data
@@ -54,18 +56,25 @@ class _MessageBase(ABC, BaseModel):
     @classmethod
     def loads(cls: Type[T], data: bytes) -> T:
         """Deserialize the SMP message."""
-        message = cls(
-            header=smpheader.Header.loads(data[: smpheader.Header.SIZE]),
-            **cast(dict, cbor2.loads(data[smpheader.Header.SIZE :])),
-            smp_data=data,
-        )
-        if message.header is None:  # pragma: no cover
-            raise ValueError
-        if message.header.group_id != cls._GROUP_ID:  # pragma: no cover
+        header = smpheader.Header.loads(data[: smpheader.Header.SIZE])
+        if header.group_id != cls._GROUP_ID:  # pragma: no cover
             raise SMPMismatchedGroupId(
-                f"{cls.__name__} has {cls._GROUP_ID}, header has {message.header.group_id}"
+                f"{cls.__name__} has {cls._GROUP_ID}, header has {header.group_id}"
             )
-        return message
+        if header.flags & smpheader.Flag.FORWARD_TREE:
+            cbor_body = data[smpheader.Header.SIZE : -smpheader.ForwardTree.SIZE]
+            extra = {
+                'forward_tree': smpheader.ForwardTree.loads(data[-smpheader.ForwardTree.SIZE :])
+            }
+        else:
+            cbor_body = data[smpheader.Header.SIZE :]
+            extra = {}
+        return cls(
+            header=header,
+            **cast(dict, cbor2.loads(cbor_body)),
+            smp_data=data,
+            **extra,
+        )
 
     @classmethod
     def load(cls: Type[T], header: smpheader.Header, data: dict) -> T:
@@ -80,20 +89,27 @@ class _MessageBase(ABC, BaseModel):
         data_bytes = cbor2.dumps(
             self.model_dump(
                 exclude_unset=True,
-                exclude={'header', 'version', 'sequence', 'smp_data'},
+                exclude={'header', 'version', 'sequence', 'smp_data', 'forward_tree'},
                 exclude_none=True,
             ),
             canonical=True,
         )
         if self.header is None:  # create the header
+            is_forward_tree = self.forward_tree is not None
+            flags = smpheader.Flag(self._FLAGS)
+            if is_forward_tree:
+                flags |= smpheader.Flag.FORWARD_TREE
+            length = len(data_bytes) + (
+                smpheader.ForwardTree.SIZE if is_forward_tree else 0
+            )
             object.__setattr__(
                 self,
                 'header',
                 smpheader.Header(
                     op=self._OP,
                     version=self.version,
-                    flags=smpheader.Flag(self._FLAGS),
-                    length=len(data_bytes),
+                    flags=flags,
+                    length=length,
                     group_id=self._GROUP_ID,
                     sequence=next(_counter) % 0xFF if self.sequence is None else self.sequence,
                     command_id=self._COMMAND_ID,
@@ -101,9 +117,13 @@ class _MessageBase(ABC, BaseModel):
             )
             object.__setattr__(self, 'sequence', self.header.sequence)
         else:  # validate the header and update version & sequence
-            if self.smp_data is None and self.header.length != len(data_bytes):
+            is_forward_tree = (self.header.flags & smpheader.Flag.FORWARD_TREE) > 0
+            length = len(data_bytes) + (
+                smpheader.ForwardTree.SIZE if is_forward_tree else 0
+            )
+            if self.smp_data is None and self.header.length != length:
                 raise SMPMalformed(
-                    f"header.length {self.header.length} != len(data_bytes) {len(data_bytes)}"
+                    f"header.length {self.header.length} != len(data_bytes) {length}"
                 )
             if self.sequence is not None:  # pragma: no cover
                 raise ValueError(
@@ -118,7 +138,27 @@ class _MessageBase(ABC, BaseModel):
                 )
             object.__setattr__(self, 'version', self.header.version)
         if self.smp_data is None:
-            object.__setattr__(self, 'smp_data', bytes(self.header) + data_bytes)
+            forward = bytes(self.forward_tree) if is_forward_tree else b''
+            object.__setattr__(self, 'smp_data', bytes(self.header) + data_bytes + forward)
+
+    def set_header(self, **header_kwargs: Any) -> '_MessageBase':
+        new_header = replace(self.header, **header_kwargs)
+        return self.model_copy(update={'header': new_header})
+
+    def set_forward(self, forward: smpheader.ForwardTree) -> '_MessageBase':
+        """Return a new message carrying `forward`, re-serialized with it.
+
+        `model_copy` would skip `model_post_init`, leaving `smp_data` without the
+        forward tree, so the message is rebuilt from its body fields instead. The
+        rebuilt message is assigned a fresh sequence.
+        """
+        body = self.model_dump(
+            exclude_unset=True,
+            exclude={'header', 'sequence', 'smp_data', 'forward_tree'},
+            exclude_none=True,
+        )
+        return self.__class__(version=self.version, forward_tree=forward, **body)
+
 
     # # Uncomment this to create a record for a de/serialization regression lock
     #     self._log_serialized_bytes()
@@ -131,7 +171,7 @@ class _MessageBase(ABC, BaseModel):
 
     #     kwargs = self.model_dump(
     #         exclude_unset=True,
-    #         exclude={'header', 'version', 'sequence', 'smp_data'},
+    #         exclude={'header', 'version', 'sequence', 'smp_data', 'forward_tree'},
     #         exclude_none=True,
     #     )
 
